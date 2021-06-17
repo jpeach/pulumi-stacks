@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"os/user"
 
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/ec2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -16,29 +17,39 @@ import (
 	"inet.af/netaddr"
 )
 
-// Ref https://www.pulumi.com/docs/reference/pkg/aws/ec2/instance/
-
-// VPCPrefix is the CIDR network for the whole VPC.
-var VPCPrefix = netaddr.MustParseIPPrefix("172.16.0.0/16")
-
-// PublicSubnet is the CIDR network for the EC2 instances subnet.
-var PublicSubnet = netaddr.MustParseIPPrefix("172.16.1.0/24")
-
-// PrivateSubnet is the CIDR network for the EC2 instances subnet.
-var PrivateSubnet = netaddr.MustParseIPPrefix("172.16.2.0/24")
+// Networks defines the IP ranges for the networks we will build.
+var Networks = map[string]netaddr.IPPrefix{
+	"vpc":      netaddr.MustParseIPPrefix("172.16.0.0/16"), // Whole VPC.
+	"dmz":      netaddr.MustParseIPPrefix("172.16.1.0/24"), // Ingress DMZ.
+	"workload": netaddr.MustParseIPPrefix("172.16.2.0/24"), // Workloads.
+}
 
 // MaxInstances is the count of EC2 instances to build.
-const MaxInstances = 1
+const MaxInstances = 6
 
 // Fedora34 is the Fedora34 AMI image. Pre-configured user is "fedora".
 const Fedora34 = "ami-0edc79a9bdc9f4eba"
+
+// DefaultInstanceType is the EC2 instance type to use.
+const DefaultInstanceType = "t2.2xlarge" // x64, 8 CPU, 32 GiB
+
+// DefaultNamePrefix is the default prefix for resource names.
+var DefaultNamePrefix string
+
+// NameTags ...
+func NameTags(ctx *pulumi.Context, id string) pulumi.StringMap {
+	name := fmt.Sprintf("%s-%s-%s", DefaultNamePrefix, ctx.Stack(), id)
+	return pulumi.StringMap{
+		"Name": pulumi.String(name),
+	}
+}
 
 // FirstAllocatable returns the first allocatable address in the network
 // prefix.  Skips the zero address, and the first 3 that AWS reserves in
 // each subnet.
 //
 // See https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Subnets.html
-func FirstAllocatable(net *netaddr.IPPrefix) (netaddr.IP, error) {
+func FirstAllocatable(net netaddr.IPPrefix) (netaddr.IP, error) {
 	r := net.Range()
 	addr := r.From()
 	skipped := 0
@@ -112,6 +123,8 @@ func FetchPrivateKey(privKeyPath string) (ssh.PublicKey, error) {
 	return ssh.NewPublicKey(&priv.PublicKey)
 }
 
+// SecAllowIngressPort returns a security group that allows traffic on
+// the given port.
 func SecAllowIngressPort(
 	ctx *pulumi.Context,
 	vpc *ec2.Vpc,
@@ -166,14 +179,21 @@ func NewBastion(
 		VpcSecurityGroupIds: pulumi.StringArray{
 			sec.ID().ToStringOutput(),
 		},
-
 		CreditSpecification: &ec2.InstanceCreditSpecificationArgs{
 			CpuCredits: pulumi.String("unlimited"),
 		},
+		Tags: NameTags(ctx, "bastion"),
 	})
 }
 
 func main() {
+	u, err := user.Current()
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
+
+	DefaultNamePrefix = u.Username
+
 	sshKey, err := FetchPrivateKey("./ssh-key")
 	if err != nil {
 		log.Fatalf("%s", err)
@@ -182,16 +202,16 @@ func main() {
 	pulumi.Run(func(ctx *pulumi.Context) error {
 		keys, err := ec2.NewKeyPair(ctx, "dev", &ec2.KeyPairArgs{
 			PublicKey: pulumi.String(ssh.MarshalAuthorizedKey(sshKey)),
-			Tags:      pulumi.StringMap{},
+			Tags:      NameTags(ctx, "keys"),
 		})
 		if err != nil {
 			return err
 		}
 
 		vpc, err := ec2.NewVpc(ctx, "vpc", &ec2.VpcArgs{
-			CidrBlock:        pulumi.String(VPCPrefix.String()),
+			CidrBlock:        pulumi.String(Networks["vpc"].String()),
 			EnableDnsSupport: pulumi.Bool(true),
-			Tags:             pulumi.StringMap{},
+			Tags:             NameTags(ctx, "vpc"),
 		})
 		if err != nil {
 			return err
@@ -199,30 +219,26 @@ func main() {
 
 		gw, err := ec2.NewInternetGateway(ctx, "gw", &ec2.InternetGatewayArgs{
 			VpcId: vpc.ID(),
-			Tags:  pulumi.StringMap{},
+			Tags:  NameTags(ctx, "gw"),
 		})
 		if err != nil {
 			return err
 		}
 
-		public, err := ec2.NewSubnet(ctx, "public", &ec2.SubnetArgs{
+		dmzSubnet, err := ec2.NewSubnet(ctx, "dmz", &ec2.SubnetArgs{
 			VpcId:               vpc.ID(),
-			CidrBlock:           pulumi.String(PublicSubnet.String()),
+			CidrBlock:           pulumi.String(Networks["dmz"].String()),
 			MapPublicIpOnLaunch: pulumi.Bool(true),
-			Tags: pulumi.StringMap{
-				"Name": pulumi.String("jpeach/subnet/public"),
-			},
+			Tags:                NameTags(ctx, "dmz"),
 		})
 		if err != nil {
 			return err
 		}
 
-		private, err := ec2.NewSubnet(ctx, "private", &ec2.SubnetArgs{
+		workloadSubnet, err := ec2.NewSubnet(ctx, "workload", &ec2.SubnetArgs{
 			VpcId:     vpc.ID(),
-			CidrBlock: pulumi.String(PrivateSubnet.String()),
-			Tags: pulumi.StringMap{
-				"Name": pulumi.String("jpeach/subnet/private"),
-			},
+			CidrBlock: pulumi.String(Networks["workload"].String()),
+			Tags:      NameTags(ctx, "workload"),
 		})
 		if err != nil {
 			return err
@@ -236,46 +252,49 @@ func main() {
 					GatewayId: gw.ID(),
 				},
 			},
-			Tags: pulumi.StringMap{
-				"Name": pulumi.String("jpeach/vpc/routes"),
-			},
+			Tags: NameTags(ctx, "routes"),
 		})
 		if err != nil {
 			return err
 		}
 
-		_, err = ec2.NewRouteTableAssociation(ctx, "association/private", &ec2.RouteTableAssociationArgs{
-			SubnetId:     private.ID(),
+		_, err = ec2.NewRouteTableAssociation(ctx, "subnet/workload", &ec2.RouteTableAssociationArgs{
+			SubnetId:     workloadSubnet.ID(),
 			RouteTableId: routes.ID(),
 		})
 		if err != nil {
 			return err
 		}
 
-		_, err = ec2.NewRouteTableAssociation(ctx, "association/public", &ec2.RouteTableAssociationArgs{
-			SubnetId:     public.ID(),
+		_, err = ec2.NewRouteTableAssociation(ctx, "subnet/dmz", &ec2.RouteTableAssociationArgs{
+			SubnetId:     dmzSubnet.ID(),
 			RouteTableId: routes.ID(),
 		})
 		if err != nil {
 			return err
 		}
 
-		bastion, err := NewBastion(ctx, vpc, public, keys)
+		bastion, err := NewBastion(ctx, vpc, dmzSubnet, keys)
 		if err != nil {
 			return err
 		}
 
-		ctx.Export("addr.bastion", bastion.PublicIp)
+		ctx.Export("bastion.addr", bastion.PublicIp)
 
-		addr, err := FirstAllocatable(&PrivateSubnet)
+		addr, err := FirstAllocatable(Networks["workload"])
 		if err != nil {
 			return err
 		}
 
 		for i := 0; i < MaxInstances; i++ {
+			addr = addr.Next()
+			if addr.IsZero() {
+				return fmt.Errorf("IP range %s exhausted", Networks["workload"].String())
+			}
+
 			iface, err := ec2.NewNetworkInterface(ctx, fmt.Sprintf("priv/%d", i),
 				&ec2.NetworkInterfaceArgs{
-					SubnetId: private.ID(),
+					SubnetId: workloadSubnet.ID(),
 					PrivateIps: pulumi.StringArray{
 						pulumi.String(addr.String()),
 					},
@@ -287,7 +306,7 @@ func main() {
 
 			_, err = ec2.NewInstance(ctx, fmt.Sprintf("instance/%d", i), &ec2.InstanceArgs{
 				Ami:          pulumi.String(Fedora34),
-				InstanceType: pulumi.String("t2.micro"),
+				InstanceType: pulumi.String(DefaultInstanceType),
 				KeyName:      keys.KeyName,
 				NetworkInterfaces: ec2.InstanceNetworkInterfaceArray{
 					&ec2.InstanceNetworkInterfaceArgs{
@@ -298,12 +317,14 @@ func main() {
 				CreditSpecification: &ec2.InstanceCreditSpecificationArgs{
 					CpuCredits: pulumi.String("unlimited"),
 				},
+				Tags: NameTags(ctx, fmt.Sprintf("workload-%d", i)),
 			})
 			if err != nil {
 				return err
 			}
 
-			ctx.Export(fmt.Sprintf("addr.instance.%d", i), pulumi.String(addr.String()))
+			ctx.Export(fmt.Sprintf("workload.addr.%d", i), pulumi.String(addr.String()))
+
 		}
 
 		return nil
