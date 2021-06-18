@@ -25,7 +25,7 @@ var Networks = map[string]netaddr.IPPrefix{
 }
 
 // MaxInstances is the count of EC2 instances to build.
-const MaxInstances = 6
+const MaxInstances = 1
 
 // Fedora34 is the Fedora34 AMI image. Pre-configured user is "fedora".
 const Fedora34 = "ami-0edc79a9bdc9f4eba"
@@ -35,6 +35,9 @@ const DefaultInstanceType = "t2.2xlarge" // x64, 8 CPU, 32 GiB
 
 // DefaultNamePrefix is the default prefix for resource names.
 var DefaultNamePrefix string
+
+// SecurityGroups ...
+var SecurityGroups = map[string]*ec2.SecurityGroup{}
 
 // NameTags ...
 func NameTags(ctx *pulumi.Context, id string) pulumi.StringMap {
@@ -128,10 +131,10 @@ func FetchPrivateKey(privKeyPath string) (ssh.PublicKey, error) {
 func SecAllowIngressPort(
 	ctx *pulumi.Context,
 	vpc *ec2.Vpc,
+	name string,
 	port int,
 ) (*ec2.SecurityGroup, error) {
-	return ec2.NewSecurityGroup(ctx,
-		fmt.Sprintf("ingress/%d", port),
+	return ec2.NewSecurityGroup(ctx, name,
 		&ec2.SecurityGroupArgs{
 			VpcId: vpc.ID(),
 			Ingress: &ec2.SecurityGroupIngressArray{
@@ -144,6 +147,19 @@ func SecAllowIngressPort(
 					Protocol: pulumi.String("tcp"),
 				},
 			},
+		},
+	)
+}
+
+// SecAllowEgressAny ...
+func SecAllowEgressAny(
+	ctx *pulumi.Context,
+	vpc *ec2.Vpc,
+	name string,
+) (*ec2.SecurityGroup, error) {
+	return ec2.NewSecurityGroup(ctx, name,
+		&ec2.SecurityGroupArgs{
+			VpcId: vpc.ID(),
 			Egress: &ec2.SecurityGroupEgressArray{
 				&ec2.SecurityGroupEgressArgs{
 					CidrBlocks: pulumi.StringArray{
@@ -154,8 +170,59 @@ func SecAllowIngressPort(
 					Protocol: pulumi.String("-1"),
 				},
 			},
+			Tags: NameTags(ctx, name),
 		},
 	)
+}
+
+// SecAllowIngressAny ...
+func SecAllowIngressAny(
+	ctx *pulumi.Context,
+	vpc *ec2.Vpc,
+	name string,
+) (*ec2.SecurityGroup, error) {
+	return ec2.NewSecurityGroup(ctx, name,
+		&ec2.SecurityGroupArgs{
+			VpcId: vpc.ID(),
+			Ingress: &ec2.SecurityGroupIngressArray{
+				&ec2.SecurityGroupIngressArgs{
+					CidrBlocks: pulumi.StringArray{
+						pulumi.String("0.0.0.0/0"),
+					},
+					FromPort: pulumi.Int(0),
+					ToPort:   pulumi.Int(0),
+					Protocol: pulumi.String("-1"),
+				},
+			},
+			Tags: NameTags(ctx, name),
+		},
+	)
+}
+
+// InitSecurityGroups ...
+func InitSecurityGroups(ctx *pulumi.Context, vpc *ec2.Vpc) error {
+	sec, err := SecAllowIngressPort(ctx, vpc, "AllowAnywhereSsh", 22)
+	if err != nil {
+		return err
+	}
+
+	SecurityGroups["AllowAnywhereSsh"] = sec
+
+	sec, err = SecAllowEgressAny(ctx, vpc, "AllowAnyEgress")
+	if err != nil {
+		return err
+	}
+
+	SecurityGroups["AllowAnyEgress"] = sec
+
+	sec, err = SecAllowIngressAny(ctx, vpc, "AllowAnyIngress")
+	if err != nil {
+		return err
+	}
+
+	SecurityGroups["AllowAnyIngress"] = sec
+
+	return nil
 }
 
 // NewBastion ...
@@ -165,11 +232,6 @@ func NewBastion(
 	subnet *ec2.Subnet,
 	keys *ec2.KeyPair,
 ) (*ec2.Instance, error) {
-	sec, err := SecAllowIngressPort(ctx, vpc, 22)
-	if err != nil {
-		return nil, err
-	}
-
 	return ec2.NewInstance(ctx, fmt.Sprintf("bastion/%d", 0), &ec2.InstanceArgs{
 		Ami:                      pulumi.String(Fedora34),
 		InstanceType:             pulumi.String("t2.micro"),
@@ -177,7 +239,8 @@ func NewBastion(
 		SubnetId:                 subnet.ID(),
 		AssociatePublicIpAddress: pulumi.Bool(true),
 		VpcSecurityGroupIds: pulumi.StringArray{
-			sec.ID().ToStringOutput(),
+			SecurityGroups["AllowAnywhereSsh"].ID().ToStringOutput(),
+			SecurityGroups["AllowAnyEgress"].ID().ToStringOutput(),
 		},
 		CreditSpecification: &ec2.InstanceCreditSpecificationArgs{
 			CpuCredits: pulumi.String("unlimited"),
@@ -217,10 +280,7 @@ func main() {
 			return err
 		}
 
-		gw, err := ec2.NewInternetGateway(ctx, "gw", &ec2.InternetGatewayArgs{
-			VpcId: vpc.ID(),
-			Tags:  NameTags(ctx, "gw"),
-		})
+		err = InitSecurityGroups(ctx, vpc)
 		if err != nil {
 			return err
 		}
@@ -235,6 +295,36 @@ func main() {
 			return err
 		}
 
+		gw, err := ec2.NewInternetGateway(ctx, "gw", &ec2.InternetGatewayArgs{
+			VpcId: vpc.ID(),
+			Tags:  NameTags(ctx, "gw"),
+		}, pulumi.Parent(dmzSubnet))
+		if err != nil {
+			return err
+		}
+
+		gwRoutes, err := ec2.NewRouteTable(ctx, "routes/gw", &ec2.RouteTableArgs{
+			VpcId: vpc.ID(),
+			Routes: ec2.RouteTableRouteArray{
+				&ec2.RouteTableRouteArgs{
+					CidrBlock: pulumi.String("0.0.0.0/0"),
+					GatewayId: gw.ID(),
+				},
+			},
+			Tags: NameTags(ctx, "gw-routes"),
+		}, pulumi.Parent(dmzSubnet))
+		if err != nil {
+			return err
+		}
+
+		_, err = ec2.NewRouteTableAssociation(ctx, "gw/dmz", &ec2.RouteTableAssociationArgs{
+			SubnetId:     dmzSubnet.ID(),
+			RouteTableId: gwRoutes.ID(),
+		}, pulumi.Parent(gwRoutes))
+		if err != nil {
+			return err
+		}
+
 		workloadSubnet, err := ec2.NewSubnet(ctx, "workload", &ec2.SubnetArgs{
 			VpcId:     vpc.ID(),
 			CidrBlock: pulumi.String(Networks["workload"].String()),
@@ -244,31 +334,53 @@ func main() {
 			return err
 		}
 
-		routes, err := ec2.NewRouteTable(ctx, "routes", &ec2.RouteTableArgs{
+		natEIP, err := ec2.NewEip(ctx, "eip/nat", &ec2.EipArgs{
+			Vpc:  pulumi.Bool(true),
+			Tags: NameTags(ctx, "nat-eip"),
+		})
+		if err != nil {
+			return err
+		}
+
+		nat, err := ec2.NewNatGateway(ctx, "nat", &ec2.NatGatewayArgs{
+			AllocationId:     natEIP.ID(),
+			SubnetId:         workloadSubnet.ID(),
+			ConnectivityType: pulumi.String("public"),
+			Tags:             NameTags(ctx, "nat"),
+		}, pulumi.Parent(workloadSubnet))
+		if err != nil {
+			return err
+		}
+
+		natRoutes, err := ec2.NewRouteTable(ctx, "routes/nat", &ec2.RouteTableArgs{
 			VpcId: vpc.ID(),
 			Routes: ec2.RouteTableRouteArray{
 				&ec2.RouteTableRouteArgs{
-					CidrBlock: pulumi.String("0.0.0.0/0"),
-					GatewayId: gw.ID(),
+					CidrBlock:    pulumi.String("0.0.0.0/0"),
+					NatGatewayId: nat.ID(),
 				},
 			},
-			Tags: NameTags(ctx, "routes"),
-		})
+			Tags: NameTags(ctx, "nat-routes"),
+		}, pulumi.Parent(workloadSubnet))
 		if err != nil {
 			return err
 		}
 
-		_, err = ec2.NewRouteTableAssociation(ctx, "subnet/workload", &ec2.RouteTableAssociationArgs{
+		_, err = ec2.NewRouteTableAssociation(ctx, "nat/workload", &ec2.RouteTableAssociationArgs{
 			SubnetId:     workloadSubnet.ID(),
-			RouteTableId: routes.ID(),
-		})
+			RouteTableId: natRoutes.ID(),
+		}, pulumi.Parent(natRoutes))
 		if err != nil {
 			return err
 		}
 
-		_, err = ec2.NewRouteTableAssociation(ctx, "subnet/dmz", &ec2.RouteTableAssociationArgs{
-			SubnetId:     dmzSubnet.ID(),
-			RouteTableId: routes.ID(),
+		// Per the guide linked below, the routing table with the NAT
+		// gateway should be the main table.
+		//
+		// https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Scenario2.html
+		_, err = ec2.NewMainRouteTableAssociation(ctx, "main", &ec2.MainRouteTableAssociationArgs{
+			VpcId:        vpc.ID(),
+			RouteTableId: natRoutes.ID(),
 		})
 		if err != nil {
 			return err
@@ -298,7 +410,12 @@ func main() {
 					PrivateIps: pulumi.StringArray{
 						pulumi.String(addr.String()),
 					},
-					Tags: pulumi.StringMap{},
+					SecurityGroups: pulumi.StringArray{
+						SecurityGroups["AllowAnywhereSsh"].ID().ToStringOutput(),
+						SecurityGroups["AllowAnyEgress"].ID().ToStringOutput(),
+						SecurityGroups["AllowAnyIngress"].ID().ToStringOutput(),
+					},
+					Tags: NameTags(ctx, fmt.Sprintf("iface-%d", i)),
 				})
 			if err != nil {
 				return err
