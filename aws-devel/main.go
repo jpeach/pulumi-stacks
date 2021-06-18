@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/user"
+	"strings"
 
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/ec2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -40,10 +41,10 @@ var DefaultNamePrefix string
 var SecurityGroups = map[string]*ec2.SecurityGroup{}
 
 // NameTags ...
-func NameTags(ctx *pulumi.Context, id string) pulumi.StringMap {
-	name := fmt.Sprintf("%s-%s-%s", DefaultNamePrefix, ctx.Stack(), id)
+func NameTags(ctx *pulumi.Context, id ...string) pulumi.StringMap {
+	parts := append([]string{DefaultNamePrefix, ctx.Stack()}, id...)
 	return pulumi.StringMap{
-		"Name": pulumi.String(name),
+		"Name": pulumi.String(strings.Join(parts, "-")),
 	}
 }
 
@@ -126,40 +127,55 @@ func FetchPrivateKey(privKeyPath string) (ssh.PublicKey, error) {
 	return ssh.NewPublicKey(&priv.PublicKey)
 }
 
-// SecAllowIngressPort returns a security group that allows traffic on
-// the given port.
-func SecAllowIngressPort(
-	ctx *pulumi.Context,
-	vpc *ec2.Vpc,
-	name string,
-	port int,
-) (*ec2.SecurityGroup, error) {
-	return ec2.NewSecurityGroup(ctx, name,
+// SecGroupBastion is a security group for bastion instances.
+func SecGroupBastion(ctx *pulumi.Context, vpc *ec2.Vpc) (*ec2.SecurityGroup, error) {
+	return ec2.NewSecurityGroup(ctx, "bastion",
 		&ec2.SecurityGroupArgs{
 			VpcId: vpc.ID(),
+			Ingress: &ec2.SecurityGroupIngressArray{
+				// Allow inbound SSH.
+				&ec2.SecurityGroupIngressArgs{
+					CidrBlocks: pulumi.StringArray{
+						pulumi.String("0.0.0.0/0"),
+					},
+					FromPort: pulumi.Int(22),
+					ToPort:   pulumi.Int(22),
+					Protocol: pulumi.String("tcp"),
+				},
+			},
+			Egress: &ec2.SecurityGroupEgressArray{
+				// Allow any outbound.
+				&ec2.SecurityGroupEgressArgs{
+					CidrBlocks: pulumi.StringArray{
+						pulumi.String("0.0.0.0/0"),
+					},
+					FromPort: pulumi.Int(0),
+					ToPort:   pulumi.Int(0),
+					Protocol: pulumi.String("-1"),
+				},
+			},
+			Tags: NameTags(ctx, "sec", "bastion"),
+		},
+	)
+}
+
+// SecGroupWorkload is a security group for workload instances.
+func SecGroupWorkload(ctx *pulumi.Context, vpc *ec2.Vpc) (*ec2.SecurityGroup, error) {
+	return ec2.NewSecurityGroup(ctx, "workload",
+		&ec2.SecurityGroupArgs{
+			VpcId: vpc.ID(),
+			// Allow any inbound.
 			Ingress: &ec2.SecurityGroupIngressArray{
 				&ec2.SecurityGroupIngressArgs{
 					CidrBlocks: pulumi.StringArray{
 						pulumi.String("0.0.0.0/0"),
 					},
-					FromPort: pulumi.Int(port),
-					ToPort:   pulumi.Int(port),
-					Protocol: pulumi.String("tcp"),
+					FromPort: pulumi.Int(0),
+					ToPort:   pulumi.Int(0),
+					Protocol: pulumi.String("-1"),
 				},
 			},
-		},
-	)
-}
-
-// SecAllowEgressAny ...
-func SecAllowEgressAny(
-	ctx *pulumi.Context,
-	vpc *ec2.Vpc,
-	name string,
-) (*ec2.SecurityGroup, error) {
-	return ec2.NewSecurityGroup(ctx, name,
-		&ec2.SecurityGroupArgs{
-			VpcId: vpc.ID(),
+			// Allow any outbound.
 			Egress: &ec2.SecurityGroupEgressArray{
 				&ec2.SecurityGroupEgressArgs{
 					CidrBlocks: pulumi.StringArray{
@@ -170,57 +186,26 @@ func SecAllowEgressAny(
 					Protocol: pulumi.String("-1"),
 				},
 			},
-			Tags: NameTags(ctx, name),
-		},
-	)
-}
-
-// SecAllowIngressAny ...
-func SecAllowIngressAny(
-	ctx *pulumi.Context,
-	vpc *ec2.Vpc,
-	name string,
-) (*ec2.SecurityGroup, error) {
-	return ec2.NewSecurityGroup(ctx, name,
-		&ec2.SecurityGroupArgs{
-			VpcId: vpc.ID(),
-			Ingress: &ec2.SecurityGroupIngressArray{
-				&ec2.SecurityGroupIngressArgs{
-					CidrBlocks: pulumi.StringArray{
-						pulumi.String("0.0.0.0/0"),
-					},
-					FromPort: pulumi.Int(0),
-					ToPort:   pulumi.Int(0),
-					Protocol: pulumi.String("-1"),
-				},
-			},
-			Tags: NameTags(ctx, name),
+			Tags: NameTags(ctx, "sec", "workload"),
 		},
 	)
 }
 
 // InitSecurityGroups ...
 func InitSecurityGroups(ctx *pulumi.Context, vpc *ec2.Vpc) error {
-	sec, err := SecAllowIngressPort(ctx, vpc, "AllowAnywhereSsh", 22)
-	if err != nil {
-		return err
+	sec := map[string]func(ctx *pulumi.Context, vpc *ec2.Vpc) (*ec2.SecurityGroup, error){
+		"Bastion":  SecGroupBastion,
+		"Workload": SecGroupWorkload,
 	}
 
-	SecurityGroups["AllowAnywhereSsh"] = sec
+	for n, f := range sec {
+		grp, err := f(ctx, vpc)
+		if err != nil {
+			return err
+		}
 
-	sec, err = SecAllowEgressAny(ctx, vpc, "AllowAnyEgress")
-	if err != nil {
-		return err
+		SecurityGroups[n] = grp
 	}
-
-	SecurityGroups["AllowAnyEgress"] = sec
-
-	sec, err = SecAllowIngressAny(ctx, vpc, "AllowAnyIngress")
-	if err != nil {
-		return err
-	}
-
-	SecurityGroups["AllowAnyIngress"] = sec
 
 	return nil
 }
@@ -239,8 +224,7 @@ func NewBastion(
 		SubnetId:                 subnet.ID(),
 		AssociatePublicIpAddress: pulumi.Bool(true),
 		VpcSecurityGroupIds: pulumi.StringArray{
-			SecurityGroups["AllowAnywhereSsh"].ID().ToStringOutput(),
-			SecurityGroups["AllowAnyEgress"].ID().ToStringOutput(),
+			SecurityGroups["Bastion"].ID().ToStringOutput(),
 		},
 		CreditSpecification: &ec2.InstanceCreditSpecificationArgs{
 			CpuCredits: pulumi.String("unlimited"),
@@ -413,9 +397,7 @@ func main() {
 						pulumi.String(addr.String()),
 					},
 					SecurityGroups: pulumi.StringArray{
-						SecurityGroups["AllowAnywhereSsh"].ID().ToStringOutput(),
-						SecurityGroups["AllowAnyEgress"].ID().ToStringOutput(),
-						SecurityGroups["AllowAnyIngress"].ID().ToStringOutput(),
+						SecurityGroups["Workload"].ID().ToStringOutput(),
 					},
 					Tags: NameTags(ctx, fmt.Sprintf("iface-%d", i)),
 				}, pulumi.Parent(workloadSubnet))
