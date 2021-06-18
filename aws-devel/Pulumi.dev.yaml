@@ -1,2 +1,4 @@
 config:
   aws:region: ap-southeast-2
+  workload:instanceCount: "2"
+  workload:instanceType: t2.2xlarge

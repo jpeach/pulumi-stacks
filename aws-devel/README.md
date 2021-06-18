@@ -9,6 +9,17 @@ SSH key that is written to `./ssh-key`. That key is good for all the hosts.
 All the hosts are provisioned with Fedora 34, so ssh login is as the `fedora`
 user.
 
+## Configuration
+
+| Key | Default | Description |
+| --- | --- | ---|
+| aws:region              | ap-southeast-2    | AWS region |
+| workload:instanceCount  | 2                 | Number of workload instances to create |
+| workload:instanceType   | t2.2xlarge        | AWS instance type for worklaod instances |
+
+Use [pulumi config](https://www.pulumi.com/docs/intro/concepts/config/)
+to change the configuration.
+
 ## Sample session
 
 ```

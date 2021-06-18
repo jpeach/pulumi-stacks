@@ -14,6 +14,7 @@ import (
 
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/ec2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
 	"golang.org/x/crypto/ssh"
 	"inet.af/netaddr"
 )
@@ -25,14 +26,8 @@ var Networks = map[string]netaddr.IPPrefix{
 	"workload": netaddr.MustParseIPPrefix("172.16.2.0/24"), // Workloads.
 }
 
-// MaxInstances is the count of EC2 instances to build.
-const MaxInstances = 1
-
 // Fedora34 is the Fedora34 AMI image. Pre-configured user is "fedora".
 const Fedora34 = "ami-0edc79a9bdc9f4eba"
-
-// DefaultInstanceType is the EC2 instance type to use.
-const DefaultInstanceType = "t2.2xlarge" // x64, 8 CPU, 32 GiB
 
 // DefaultNamePrefix is the default prefix for resource names.
 var DefaultNamePrefix string
@@ -384,7 +379,10 @@ func main() {
 			return err
 		}
 
-		for i := 0; i < MaxInstances; i++ {
+		// Config for workload instances.
+		workloadConf := config.New(ctx, "workload")
+
+		for i := 0; i < workloadConf.RequireInt("instanceCount"); i++ {
 			addr = addr.Next()
 			if addr.IsZero() {
 				return fmt.Errorf("IP range %s exhausted", Networks["workload"].String())
@@ -405,9 +403,11 @@ func main() {
 				return err
 			}
 
+			instanceType := workloadConf.Require("instanceType")
+
 			_, err = ec2.NewInstance(ctx, fmt.Sprintf("instance/%d", i), &ec2.InstanceArgs{
 				Ami:          pulumi.String(Fedora34),
-				InstanceType: pulumi.String(DefaultInstanceType),
+				InstanceType: pulumi.String(instanceType),
 				KeyName:      keys.KeyName,
 				NetworkInterfaces: ec2.InstanceNetworkInterfaceArray{
 					&ec2.InstanceNetworkInterfaceArgs{
