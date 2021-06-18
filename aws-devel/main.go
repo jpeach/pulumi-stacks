@@ -342,9 +342,11 @@ func main() {
 			return err
 		}
 
+		// The NAT gateway has to be in dmz subnet so it can use the
+		// internet gateway there to get out.
 		nat, err := ec2.NewNatGateway(ctx, "nat", &ec2.NatGatewayArgs{
 			AllocationId:     natEIP.ID(),
-			SubnetId:         workloadSubnet.ID(),
+			SubnetId:         dmzSubnet.ID(),
 			ConnectivityType: pulumi.String("public"),
 			Tags:             NameTags(ctx, "nat"),
 		}, pulumi.Parent(workloadSubnet))
@@ -416,7 +418,7 @@ func main() {
 						SecurityGroups["AllowAnyIngress"].ID().ToStringOutput(),
 					},
 					Tags: NameTags(ctx, fmt.Sprintf("iface-%d", i)),
-				})
+				}, pulumi.Parent(workloadSubnet))
 			if err != nil {
 				return err
 			}
@@ -435,7 +437,7 @@ func main() {
 					CpuCredits: pulumi.String("unlimited"),
 				},
 				Tags: NameTags(ctx, fmt.Sprintf("workload-%d", i)),
-			})
+			}, pulumi.Parent(iface))
 			if err != nil {
 				return err
 			}
