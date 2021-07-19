@@ -50,6 +50,7 @@ type Config struct {
 }
 
 // GenerateSSHKeys ...
+// TODO: collapse this in to the keygen code from aws-devel
 func GenerateSSHKeys() (string, string, error) {
 	// IMPORTANT: For GCP it has to be 3072 bit key, when tried to use 2048 or
 	//            4096 it was not adding it to the authorized_keys file on
@@ -74,12 +75,6 @@ func GenerateSSHKeys() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	// f, err := os.OpenFile(privKeyPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0400)
-	// if err != nil {
-	// 	return err
-	// }
-	//
-	// defer f.Close()
 
 	return privBuffer.String(), base64.StdEncoding.EncodeToString(public.Marshal()), nil
 }
@@ -142,17 +137,17 @@ func main() {
 			_ = ctx.Log.Info(createPubKey, nil)
 
 			return errors.New("cannot proceed without necessary ssh keys")
-		} else {
-			publicKeySecret, err := secretmanager.LookupSecretVersion(ctx, &secretmanager.LookupSecretVersionArgs{
-				Secret: PublicKeySecretName,
-			})
-			if err != nil {
-				return err
-			}
-
-			privateKey = privateKeySecret.SecretData
-			publicKey = publicKeySecret.SecretData
 		}
+
+		publicKeySecret, err := secretmanager.LookupSecretVersion(ctx, &secretmanager.LookupSecretVersionArgs{
+			Secret: PublicKeySecretName,
+		})
+		if err != nil {
+			return err
+		}
+
+		privateKey = privateKeySecret.SecretData
+		publicKey = publicKeySecret.SecretData
 
 		sshKeys := []string{
 			fmt.Sprintf("%s:ssh-rsa %s %[1]s", u.Username, publicKey),

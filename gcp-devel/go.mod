@@ -1,6 +1,6 @@
 module gcp-devel
 
-go 1.14
+go 1.16
 
 require (
 	github.com/pulumi/pulumi-gcp/sdk/v5 v5.9.0
