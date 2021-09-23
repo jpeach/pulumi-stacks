@@ -1,22 +1,18 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"golang.org/x/crypto/ssh"
 	"log"
-	"os"
 	"os/user"
 	"strings"
 
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/ec2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
-	"golang.org/x/crypto/ssh"
 	"inet.af/netaddr"
+
+	"github.com/jpeach/pulumi-stacks/pkg/keys"
 )
 
 // Networks defines the IP ranges for the networks we will build.
@@ -68,58 +64,6 @@ func FirstAllocatable(net netaddr.IPPrefix) (netaddr.IP, error) {
 			return addr, nil
 		}
 	}
-}
-
-// GeneratePrivateKey ...
-func GeneratePrivateKey(privKeyPath string) error {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return err
-	}
-
-	b := pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(priv),
-	}
-
-	f, err := os.OpenFile(privKeyPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-
-	defer f.Close()
-	return pem.Encode(f, &b)
-}
-
-// FetchPrivateKey ...
-func FetchPrivateKey(privKeyPath string) (ssh.PublicKey, error) {
-	k, err := ioutil.ReadFile(privKeyPath)
-	if os.IsNotExist(err) {
-		if err := GeneratePrivateKey(privKeyPath); err != nil {
-			return nil, err
-		}
-
-		k, err = ioutil.ReadFile(privKeyPath)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	b, _ := pem.Decode(k)
-	if b == nil {
-		return nil, fmt.Errorf("no PEM data in %q", privKeyPath)
-	}
-	if b.Type != "RSA PRIVATE KEY" {
-		return nil, fmt.Errorf("wrong key type %q", b.Type)
-	}
-
-	priv, err := x509.ParsePKCS1PrivateKey(b.Bytes)
-	if err != nil {
-		return nil, err
-	}
-
-	return ssh.NewPublicKey(&priv.PublicKey)
 }
 
 // SecGroupBastion is a security group for bastion instances.
@@ -236,7 +180,7 @@ func main() {
 
 	DefaultNamePrefix = u.Username
 
-	sshKey, err := FetchPrivateKey("./ssh-key")
+	sshKey, err := keys.NewPublicKey("./ssh-key")
 	if err != nil {
 		log.Fatalf("%s", err)
 	}
