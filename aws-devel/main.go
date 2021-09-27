@@ -2,16 +2,20 @@ package main
 
 import (
 	"fmt"
-	"golang.org/x/crypto/ssh"
 	"log"
+	"os"
 	"os/user"
+	"path"
 	"strings"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/ec2"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
 	"inet.af/netaddr"
 
+	"github.com/jpeach/pulumi-stacks/pkg/conf"
 	"github.com/jpeach/pulumi-stacks/pkg/keys"
 )
 
@@ -24,6 +28,9 @@ var Networks = map[string]netaddr.IPPrefix{
 
 // Fedora34 is the Fedora34 AMI image. Pre-configured user is "fedora".
 const Fedora34 = "ami-0edc79a9bdc9f4eba"
+
+const SSHIdentityPath = "./ssh/identity.pem"
+const SSHConfigPath = "./ssh/config"
 
 // DefaultNamePrefix is the default prefix for resource names.
 var DefaultNamePrefix string
@@ -180,7 +187,16 @@ func main() {
 
 	DefaultNamePrefix = u.Username
 
-	sshKey, err := keys.NewPublicKey("./ssh-key")
+	if err := os.MkdirAll(path.Dir(SSHIdentityPath), 0700); err != nil {
+		log.Fatalf("%s", err)
+	}
+
+	sshKey, err := keys.NewPublicKey(SSHIdentityPath)
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
+
+	sshConf, err := conf.NewSSH(SSHConfigPath)
 	if err != nil {
 		log.Fatalf("%s", err)
 	}
@@ -317,6 +333,10 @@ func main() {
 		}
 
 		ctx.Export("bastion.addr", bastion.PublicIp)
+		bastion.PublicIp.ApplyT(func(addr string) (string, error) {
+			err := sshConf.WriteBastionHost(addr, SSHIdentityPath)
+			return "", err
+		})
 
 		addr, err := FirstAllocatable(Networks["workload"])
 		if err != nil {
@@ -369,7 +389,7 @@ func main() {
 			}
 
 			ctx.Export(fmt.Sprintf("workload.addr.%d", i), pulumi.String(addr.String()))
-
+			sshConf.WriteWorkloadHost(addr.String(), SSHIdentityPath)
 		}
 
 		return nil
